@@ -78,9 +78,25 @@ st.markdown("""
 # ─── Data Loader ──────────────────────────────────────────────────────────────
 DATA_URL = "https://uc.hackerearth.com/he-public-ap-south-1/jan%20to%20may%20police%20violation_anonymized791b166.csv"
 
-@st.cache_data(show_spinner="Loading violation dataset…")
+USE_COLS = [
+    "id", "created_datetime", "closed_datetime", "violation_type",
+    "latitude", "longitude", "vehicle_type", "police_station",
+    "junction_name", "validation_status",
+]
+
+@st.cache_data(show_spinner="Loading violation dataset…", ttl=3600, max_entries=1)
 def load_data() -> pd.DataFrame:
-    df = pd.read_csv(DATA_URL, low_memory=False)
+    df = pd.read_csv(
+        DATA_URL,
+        usecols=lambda c: c in USE_COLS,
+        dtype={
+            "vehicle_type": "category",
+            "police_station": "category",
+            "junction_name": "category",
+            "validation_status": "category",
+        },
+        low_memory=False,
+    )
 
     # Datetime
     df["created_datetime"] = pd.to_datetime(df["created_datetime"], utc=True, errors="coerce")
@@ -88,6 +104,11 @@ def load_data() -> pd.DataFrame:
     df["month"] = df["created_datetime"].dt.month
     df["dow"]   = df["created_datetime"].dt.day_name()
     df["date"]  = df["created_datetime"].dt.date
+
+    # Drop rows without coordinates (do this early, before expensive string ops)
+    df = df.dropna(subset=["latitude", "longitude"])
+    df = df[(df["latitude"] > 12.7) & (df["latitude"] < 13.4)]
+    df = df[(df["longitude"] > 77.4) & (df["longitude"] < 77.9)]
 
     # Clean violation labels — strip JSON brackets & quotes
     df["violation_clean"] = (
@@ -105,24 +126,18 @@ def load_data() -> pd.DataFrame:
         "|".join(PARKING_KEYWORDS), case=False, na=False
     )
 
-    # Congestion impact score (heuristic):
+    # Congestion impact score (heuristic, vectorized instead of row-wise .apply):
     # Main road parking = high impact; footpath/wrong = medium; no parking = medium-low
-    def impact(row):
-        v = str(row["violation_clean"]).upper()
-        if "MAIN ROAD" in v:
-            return 3
-        if "FOOTPATH" in v or "DOUBLE" in v or "BUSTOP" in v or "SCHOOL" in v:
-            return 2
-        if "NO PARKING" in v or "WRONG PARKING" in v:
-            return 1
-        return 0
-
-    df["impact_score"] = df.apply(impact, axis=1)
-
-    # Drop rows without coordinates
-    df = df.dropna(subset=["latitude", "longitude"])
-    df = df[(df["latitude"] > 12.7) & (df["latitude"] < 13.4)]
-    df = df[(df["longitude"] > 77.4) & (df["longitude"] < 77.9)]
+    v_upper = df["violation_clean"].str.upper()
+    df["impact_score"] = np.select(
+        [
+            v_upper.str.contains("MAIN ROAD", na=False),
+            v_upper.str.contains("FOOTPATH|DOUBLE|BUSTOP|SCHOOL", na=False),
+            v_upper.str.contains("NO PARKING|WRONG PARKING", na=False),
+        ],
+        [3, 2, 1],
+        default=0,
+    )
 
     # Resolution time (minutes)
     df["closed_datetime"] = pd.to_datetime(df["closed_datetime"], utc=True, errors="coerce")
@@ -137,7 +152,7 @@ def load_data() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner="Computing hotspots…")
+@st.cache_data(show_spinner="Computing hotspots…", max_entries=5)
 def compute_hotspots(df: pd.DataFrame, grid_size: float = 0.005) -> pd.DataFrame:
     """Grid-based hotspot aggregation with risk scoring."""
     parking = df[df["is_parking"]].copy()
@@ -278,7 +293,10 @@ with tab1:
             tiles="CartoDB dark_matter",
         )
 
-        sample = df_parking.sample(min(len(df_parking), 30000), random_state=42)
+        # Heatmap points are cheap (just float triples), Cluster Markers are
+        # expensive (a full Folium object + HTML popup string per point).
+        MAP_SAMPLE_CAP = 15000 if map_type == "Heatmap" else 2000
+        sample = df_parking.sample(min(len(df_parking), MAP_SAMPLE_CAP), random_state=42)
 
         if map_type == "Heatmap":
             heat_data = sample[["latitude", "longitude", "impact_score"]].values.tolist()
@@ -859,7 +877,7 @@ with tab6:
     with st.expander("View preprocessing steps (click to expand)", expanded=True):
 
         # ── 1a. Feature engineering from raw data
-        @st.cache_data(show_spinner="Building ML feature matrix…")
+        @st.cache_data(show_spinner="Building ML feature matrix…", max_entries=3)
         def build_features(df: pd.DataFrame):
             """
             Target  : is_high_impact  (1 = main road blocking, 0 = other parking)
@@ -999,8 +1017,10 @@ with tab6:
     scaler  = StandardScaler()
     X_scaled = scaler.fit_transform(X_imp)
 
-    # Stratified subsample for speed (max 50k rows)
-    MAX_ROWS = 50_000
+    # Stratified subsample for speed (max 15k rows) — training happens live
+    # on a button click, on top of everything else already cached, so keep
+    # this conservative to avoid memory spikes.
+    MAX_ROWS = 15_000
     if len(X_scaled) > MAX_ROWS:
         idx = np.random.RandomState(int(random_state)).choice(len(X_scaled), MAX_ROWS, replace=False)
         X_s, y_s = X_scaled[idx], y_full.iloc[idx]
@@ -1036,7 +1056,7 @@ with tab6:
             "Choose algorithm",
             ["Random Forest", "Gradient Boosting (XGBoost-style)"],
         )
-        n_estimators = st.slider("Number of trees / estimators", 50, 300, 100, step=50)
+        n_estimators = st.slider("Number of trees / estimators", 50, 150, 100, step=50)
         max_depth    = st.slider("Max depth", 3, 15, 6)
 
     with model_col2:
@@ -1075,7 +1095,7 @@ with tab6:
                     max_depth=max_depth,
                     class_weight="balanced",
                     random_state=int(random_state),
-                    n_jobs=-1,
+                    n_jobs=2,
                 )
                 model.fit(X_train, y_train)
             else:
@@ -1211,12 +1231,14 @@ with tab6:
         )
 
         # Cross-validation
-        st.markdown("#### Cross-Validation (5-Fold)")
-        with st.spinner("Running 5-fold cross-validation…"):
-            cv_scores = cross_val_score(model, X_s, y_s, cv=5, scoring="f1_weighted", n_jobs=-1)
+        st.markdown("#### Cross-Validation (3-Fold)")
+        with st.spinner("Running 3-fold cross-validation…"):
+            # n_jobs=-1 here would fit up to 5 models in parallel/in memory at
+            # once on top of the original model — capped to limit peak RAM.
+            cv_scores = cross_val_score(model, X_s, y_s, cv=3, scoring="f1_weighted", n_jobs=2)
 
         cv_df = pd.DataFrame({
-            "Fold": [f"Fold {i+1}" for i in range(5)],
+            "Fold": [f"Fold {i+1}" for i in range(len(cv_scores))],
             "F1-Weighted": cv_scores,
         })
         fig_cv = px.bar(
@@ -1243,7 +1265,7 @@ with tab6:
         st.plotly_chart(fig_cv, width='stretch')
 
         st.success(
-            f"5-Fold CV F1 (weighted): **{cv_scores.mean():.3f} ± {cv_scores.std():.3f}**  "
+            f"3-Fold CV F1 (weighted): **{cv_scores.mean():.3f} ± {cv_scores.std():.3f}**  "
             f"— Low variance ({cv_scores.std():.3f}) confirms the model generalises well across different data folds.",
         )
 
@@ -1284,7 +1306,7 @@ with tab6:
 | **Accuracy** | **{acc*100:.2f}%** |
 | **Weighted F1** | **{f1*100:.2f}%** |
 | **HIGH-impact F1** | **{f1_hi*100:.2f}%** |
-| **CV F1 (5-fold)** | **{cv_scores.mean():.3f} ± {cv_scores.std():.3f}** |
+| **CV F1 (3-fold)** | **{cv_scores.mean():.3f} ± {cv_scores.std():.3f}** |
 """)
 
     else:
